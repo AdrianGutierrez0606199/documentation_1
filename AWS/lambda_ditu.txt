@@ -1,0 +1,279 @@
+##############################
+## life cycle configuration ##
+##############################
+
+## Lambda para desplegar el modelo de créditop en producción que decide el cupo y plazo que se le otorgara a cada uno de los clientes
+
+import os
+import io
+import boto3
+import json
+import csv
+import datetime
+import awswrangler as wr
+import pandas as pd
+
+import time
+
+## Inputs que vienen desde las variables de entorno
+
+# Peso asignado al score de experian
+exp_weight = float(os.environ['experian_weight'])
+
+# Minimo score de coink para los clientes que no tienen informacion en xperian
+score_coink_minimo_0 = float(os.environ['minimo_score_coink_noexp'])
+
+## Cada cuanto se va a truncar el cupo
+trunc_input_cupo = float(os.environ['trunc_value_cupo'])
+
+# El score minimo de experian que deben tener para para entrar en el programa
+score_xperian_minimo = float(os.environ['minimo_score_xperian'])
+
+# porcentaje de ingresos mensuales maximo al que debe corresponder la cuota mensual
+pct_ingreso_couta_1 = float(os.environ['pct_ingreso_couta'])
+
+def lambda_handler(event, context):
+    
+    data=event
+    
+    print(data)
+    
+    ## en este prefix vamos a guardar los resultados y la data que se nos paso
+    prefix='DITU_data/model_logs_1'
+    
+    # Extraemos los datos que corresponden a las qualities
+    variables_qualities=data["query_datacredito"]["qualities"]["data"]["crts"]
+    
+    ## convertimos la información para que sea un diccionario donde la llave sea el nombre de la variable
+    ## y el valor sea el resultado de esa variable
+    new_dict = {item['name']:item['value'] for item in variables_qualities}
+    
+    ## Cargamos la lista de variables que vamos a usar.
+    key = 'DITU_data/input/variables/variables_to_use.csv'
+    bucket = 'cnk-datalake'
+    s3_resource = boto3.resource('s3')
+    s3_object = s3_resource.Object(bucket, key)
+    
+    ## llamamos el archivo que contiene las variables que vamos a usar para el modelo
+    variables_to_use = s3_object.get()['Body'].read().decode('utf-8').splitlines()
+    
+    
+    ## Extraemos el nombre de las variables que vamos a terminar usando para el modelo.
+    lines = csv.reader(variables_to_use)
+    variables_seleccionadas=[x[1] for x in lines]
+    variables_seleccionadas=variables_seleccionadas[1:len(variables_seleccionadas)]
+    
+    ## extraemos una lista de los valores de las variables en el orden que hayan quedado definidas en el modelo cargado
+    ## al endpoint.
+    valores_input=[new_dict[x] for x in variables_seleccionadas]
+    valores_input=[str(x) for x in valores_input]
+    
+    ## hacemos el string que se le pasa coo input al endpoint para que retorne el resultado
+    input_endpoint=','.join(valores_input)
+    
+    ## Corremos el modelo almacenado en el Endpoint para que nos de el puntaje de experian estimado.
+    ENDPOINT_NAME = os.environ['ENDPOINT_NAME']
+    runtime= boto3.client('runtime.sagemaker')
+    inicio=time.time()
+    response = runtime.invoke_endpoint(EndpointName=ENDPOINT_NAME,
+                                          ContentType='text/csv',
+                                          Body=input_endpoint)
+                                          
+    ## extraemos el resultado, correspondiente al puntaje de experian que esta entre [0,10]
+    result = json.loads(response['Body'].read().decode())
+    
+    ## remplazamos el resultado segun el siguiente diccionario para que este contenido en (0,10)
+    replace_dict={
+        0:0,
+        ## los de 1 hasta 400 agrupados en la misma categoria
+        1:1,
+        2:5,
+        3:6,
+        4:7,
+        5:8,
+        ## los de 800 a 1000 agrupadso en la misma categoria, el maximo
+        6:10
+    }
+    
+    ## mapeamos el resultado a su valor original
+    result=replace_dict[result]
+    
+    
+    ## Este deberia venir en el json
+    user_id_input=data['user_id']
+    
+    # # my_filter = lambda x: True if x["city"].startswith(user_id_input) else False
+    # path='s3://cnk-datalake/sagemaker/Outputs/Scores_Internos/scores_internos.parquet'
+    # df = wr.s3.read_parquet(path)
+    # df=df[df['user_id'].isin(user_id_input)]
+    
+    inicio=time.time()
+    
+    key = 'sagemaker/Outputs/Scores_internos_csv/score_coink.csv'
+    s3_resource = boto3.resource('s3')
+    s3_object_scores = s3_resource.Object(bucket, key)
+    
+    score_coink = s3_object_scores.get()['Body'].read().decode('utf-8').splitlines()
+    
+    lines_score = csv.reader(score_coink)
+    ## Extraemos el score coink de la persona que esta solicitando el crédito
+    Score_coink=[x[1] for x in lines_score if x[0]==user_id_input]
+    print(Score_coink)
+    Score_coink=float(Score_coink[0])
+    
+    final=time.time()
+    
+    ## medimos cuanto se demoro el endpoint
+    tiempo=final-inicio
+    
+    ## de aca sacamos el score consolidado del cliente
+    Score_consolidado=(result/10)*exp_weight+Score_coink*(1-exp_weight)
+    
+    ## esto tiene que venir en el json de Orlando
+    ## ingreso de la persona mensual
+    montly_income=data['query_datacredito']['income_value']['data']['resumen_general_ingresos']["promedio_ingresos_cotizante"]
+    print(montly_income)
+    
+    
+    ## valores solicitados por el cliente
+    cupo_solicitado=data['principal_req_user']
+    plazo_solicitado=data['num_paym_req_user']
+    periodicidad_pagos=data['loan_product']['repaymentFrequencyType']['value']
+    trunc_input_plazo=data['loan_product']['repaymentEvery']
+    
+    ## definicionaes del producto
+    cupo_minimo_product=data['loan_product']['minPrincipal']
+    cupo_maximo_product=data['loan_product']['maxPrincipal']
+    plazo_minimo_product=data['loan_product']['minNumberOfRepayments']
+    plazo_maximo_product=data['loan_product']['maxNumberOfRepayments']
+    
+    
+    if type(montly_income) == int or type(montly_income) == float:
+        
+        ## vamos a ver si tiene suficiente dinero para pagar el crédito
+        Couta_monthly_max=pct_ingreso_couta_1*montly_income
+        
+        ## hacemos un diccionario que le asigne a cada periodicidad de pagos, cuantos conforman un mes
+        periodicidad_pagos_dict={"Weeks":4,"Days":30,"Months":1}
+        ##periodicidad_pagos puede ser ["Weeks","Days","Months"]
+        
+        ## Tasa de interes para el periodo
+        int_rate=data['loan_product']['interestRatePerPeriod']/100
+        int_rate_freq=data['loan_product']['interestRateFrequencyType']['value']
+        
+        ## hacemos un diccionario para la periodicidad de las tasas de interes
+        periodicidad_intereses_dict={"Weeks":{"Per month" : 4, "Per year": 52},"Days":{"Per month" : 30, "Per year": 360},"Months":{"Per month" : 1, "Per year": 12}}
+        
+        
+        ## Tasa de interes por cada periodo.
+        int_rate_period=((int_rate+1)**(1/periodicidad_intereses_dict[periodicidad_pagos][int_rate_freq]))-1
+        
+        ## las cuotas tienen que estar en multiplos de este valor
+        installment_trunc=data['loan_product']['installmentAmountInMultiplesOf']
+        
+        ## cuota maxima que puede pagar en el periodo definido segun el truncamiento de los cupos
+        cuota_period_max=(Couta_monthly_max/periodicidad_pagos_dict[periodicidad_pagos])
+        cuota_period_max=(cuota_period_max//installment_trunc)*installment_trunc
+        
+        ## Maximo cupo que se le puede desembolsar aproximado
+        Cupo_aproved_max = (cuota_period_max*(1-((1+int_rate_period)**(-plazo_solicitado))))/int_rate_period
+    else:
+        Cupo_aproved_max=cupo_minimo_product
+    
+    
+    
+    ## cargamos el score del cliente:
+    
+    
+    
+    if (result==0) & (Score_coink>=score_coink_minimo_0):
+        ## calculamos el cupo para el caso en el que no tiene score de experian pero si de coink
+        cupo_asignado=cupo_minimo_product ## +((Score_coink-score_coink_minimo_0)/(1-score_coink_minimo_0))*(cupo_maximo_product-cupo_minimo_product)*0.1
+        ## truncamos el cupo (esto era en caso de que el cupo se hciera variable de alguna manera para los de 0)
+        ##cupo_asignado=cupo_asignado//trunc_input_cupo
+        # calculamos el plazo para este caso.
+        plazo_asignado=plazo_solicitado  ## +((Score_coink-score_coink_minimo_0)/(1-score_coink_minimo_0))*(plazo_maximo_product-plazo_minimo_product)*0.1
+        # Truncamos el plazo( en caso de que se decida asignar un plazo variable)
+        # plazo_asignado=(plazo_asignado//trunc_input_plazo)*trunc_input_plazo
+    elif ((result/10)>=score_xperian_minimo):
+        ## los scores estan mapeados de esta manera [0,1,5,6,7,8,9]-----> [0,1,2,3,4,5,6]
+        
+        ## asignamos el cupo correspondiente segun el mapeo. El 0.1 corresponde al punto de cupo maximo para los que no tienen información en coink
+        cupo_asignado=(cupo_minimo_product)+((Score_consolidado-score_xperian_minimo*exp_weight)/(1-score_xperian_minimo*exp_weight))*(cupo_maximo_product-cupo_minimo_product)
+ 
+        ## lo anterior es lo mismo que (cupo_minimo_product+(cupo_maximo_product-cupo_minimo_product)*0.1)+((Score_coink-score_xperian_minimo*exp_weight)/(1-score_xperian_minimo*exp_weight))*(cupo_maximo_product-(cupo_minimo_product+(cupo_maximo_product-cupo_minimo_product)*0.1))
+        
+        ## tomamos el minimo entre el cupo asignado y lo que puede pagar segun los ingresos
+        cupo_asignado=min([cupo_asignado,Cupo_aproved_max])
+        ## truncamos el cupo
+        cupo_asignado=(cupo_asignado//trunc_input_cupo)*trunc_input_cupo
+        ## asignamos ahora el plazo que le corresponderia
+        plazo_asignado=plazo_solicitado    ## (plazo_minimo_product*0.9+plazo_maximo_product*0.1)+((Score_consolidado-score_xperian_minimo*exp_weight)/(1-score_xperian_minimo*exp_weight))*(plazo_maximo_product*0.9-plazo_minimo_product*0.9)
+        #truncamos el plazo que se le asignó en caso de que se asigne un plazo según el perfil del cliente
+        ## plazo_asignado=(plazo_asignado//trunc_input_plazo)*trunc_input_plazo
+    else:
+        # definimos el cupo y el plazo igual a 0 para los clientes que no cumplen los requisitos
+        cupo_asignado=0
+        plazo_asignado=0
+    
+    #s3.put_object(Bucket=bucket,Key=prefix+fileName,Body=uploadbyteStream)
+    
+    
+    ## Guardamos la fecha en la que se hizo el request
+    time_list=[]
+    time_1=str(datetime.datetime.today()-datetime.timedelta(seconds=5*3600)).split(".")[0]
+    time_list.append(time_1)
+    
+    
+    ## guardamos toda la info que necesitamos en una base de datos
+    df = pd.DataFrame()
+    
+    ## guardar la fecha en la que se realizó la consulta
+    df['date_request']=time_list
+    
+    df['client_request']=str(data).replace(" True",'"True"').replace(" False", '"False"').replace(" None",'"None"').replace("'",'"')
+    
+    ## guardamos el user_id en la tabla
+    df['user_id']=str(user_id_input)
+    
+    ## Score experian simulado
+    df['score_predicted']=int(result)
+    
+    ## Score coink.
+    df['score_coink']=float(Score_coink)
+    
+    ##Score consolidado
+    df['score_consolidado']=float(Score_consolidado)
+    
+    ## Cupo asignado
+    df['cupo_assigned']=float(cupo_asignado)
+    
+    ##plazo asignado.
+    df['plazo_assigned']=float(plazo_asignado)
+    
+    ## ingresos mensuales de la personas
+    df['monthly_income']=int(montly_income)
+    
+    time_date=(datetime.datetime.today()-datetime.timedelta(seconds=3600*5)).strftime("%Y-%m-%d")
+    
+    ## creamos el path donde vamos a guardar los datos
+    path_f=f"s3://{bucket}/{prefix}/{time_date}/client{user_id_input}_{time_1}.snappy.parquet"
+    
+    print(path_f)
+    ## store the data in the s3 folder
+    wr.s3.to_parquet(
+        df=df,
+        path=path_f,
+        dataset=False
+    )
+    
+    return {
+        'lambda_dutation': tiempo,
+        'score_experian_simul': result,
+        'Score_coink_interno': Score_coink,
+        'Score_consolidado':Score_consolidado,
+        'Cupo': cupo_asignado,
+        'Plazo': plazo_asignado,
+        'ingreso': montly_income,
+        'Cupo_maximo':cupo_asignado
+    }
