@@ -1,0 +1,752 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+  
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+## importamos los paquetes para tratar dynamicFrames
+from awsglue.dynamicframe import DynamicFrameCollection
+from awsglue.dynamicframe import DynamicFrame
+import re
+###################################
+## paquetes que vamos a necesitar en el ETL ##
+###################################
+# to substract months from  a datetime.
+import pyspark.sql.functions as F
+# Importamos los paquetes que nos permiten realizar todas las transformaciones necesarias
+from pyspark.sql.functions import lead, row_number, when, current_timestamp,from_utc_timestamp
+# Para definir la agrupación para hacer el lag
+from pyspark.sql.window import Window
+from pyspark.sql.functions import year,month
+from pyspark.sql.functions import explode_outer
+import pyspark.sql.functions as sqlf
+# Importar tipo string
+from pyspark.sql.types import StringType
+# Importar tipo map
+from pyspark.sql.types import MapType
+# Función para transformar los datos de un json en otra estructura
+from pyspark.sql.functions import from_json
+## Estas lineas de codigo son para lograr hacer el lag en el status separado por cada device_id
+from pyspark.sql.functions import lag, col
+# Para definir la agrupación para hacer el lag
+from pyspark.sql.window import Window
+
+from pyspark.sql.functions import date_format, to_date, mean
+# Traemos la tabla que trae el estodo de salud del piggybank
+Data_HC_piggy_node1 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="hc_coink_db_prd_piggybank_piggy_bank_health_check_report",
+    transformation_ctx="Data_HC_piggy_node1",
+)
+# Seleccionamos solo los campos que necesitamos
+hc_id_details_node1650993971327 = SelectFields.apply(
+    frame=Data_HC_piggy_node1,
+    paths=["piggy_bank_health_check_report_id", "details"],
+    transformation_ctx="hc_id_details_node1650993971327",
+)
+# Convetir DynamicFrame en DataFrame
+
+df = hc_id_details_node1650993971327.toDF()
+
+# Dejar una copia de associated_data
+df2 = df.withColumn("nested_details", df["details"])
+
+# Aca abrimos el array de strings para que quede una columna con los jsons
+df2 = df2.select(
+    df2.piggy_bank_health_check_report_id,
+    explode_outer(df2.nested_details).alias("nested_details"),
+)
+
+DFtoDynamic3 = DynamicFrame.fromDF(df2, glueContext, "custom_column")
+
+df = DFtoDynamic3.toDF()
+df = df.withColumn("nested_details_copy",df["nested_details"])
+# Aca intentamos que spark lea la columna como un json
+df2 = df.withColumn("nested_details", from_json(df["nested_details"], MapType(StringType(), StringType())))
+
+DFtoDynamic = DynamicFrame.fromDF(df2, glueContext, 'custom_column')
+
+# Usar la función unbox para abrir un string field
+DFtoDynamic2 = Unbox.apply(frame = DFtoDynamic, path = "nested_details", format="json")
+
+# Usar la función UnnestFrame para convetir cada item abierto en una columna
+DFtoDynamic3 = UnnestFrame.apply(frame=DFtoDynamic2)
+
+df2 = DFtoDynamic3.toDF()
+df2 = df2.drop('nested_details')
+
+DFtoDynamic3 = DynamicFrame.fromDF(df2, glueContext, 'custom_column')
+## renombramos las variables para que sea posible hacer el join despues
+
+RenamedkeysforJoin_node1650994388223 = ApplyMapping.apply(
+    frame=DFtoDynamic3,
+    mappings=[
+        ("nested_details_copy", "string", "nested_details_copy", "string"),
+        (
+            "piggy_bank_health_check_report_id",
+            "string",
+            "piggy_bank_health_check_report_id_right",
+            "string",
+        ),
+        (
+            "`nested_details.status_code`",
+            "string",
+            "`nested_details.status_code`",
+            "string",
+        ),
+        ("`nested_details.id`", "string", "`nested_details.id`", "string"),
+        ("`nested_details.date`", "string", "`nested_details.date`", "string"),
+        ("`nested_details.message`", "string", "`nested_details.message`", "string"),
+        ("`nested_details.device`", "string", "`nested_details.device`", "string"),
+    ],
+    transformation_ctx="RenamedkeysforJoin_node1650994388223",
+)
+# Traemos de nuevo la data original y la joineamos luego con la transformada
+Original_data_node1650993770112 = SelectFields.apply(
+    frame=Data_HC_piggy_node1,
+    paths=[
+        "piggy_bank_health_check_report_id",
+        "created_date",
+        "piggy_bank_id",
+        "status_code",
+        "update_date",
+    ],
+    transformation_ctx="Original_data_node1650993770112",
+)
+# Joineamos la data unneasteada con la data original
+
+Original_data_node1650993770112DF = Original_data_node1650993770112.toDF()
+RenamedkeysforJoin_node1650994388223DF = RenamedkeysforJoin_node1650994388223.toDF()
+Join_unnested_json_w_data_node1650993859334 = DynamicFrame.fromDF(
+    Original_data_node1650993770112DF.join(
+        RenamedkeysforJoin_node1650994388223DF,
+        (
+            Original_data_node1650993770112DF["piggy_bank_health_check_report_id"]
+            == RenamedkeysforJoin_node1650994388223DF[
+                "piggy_bank_health_check_report_id_right"
+            ]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_unnested_json_w_data_node1650993859334",
+)
+## Seleccionamos los datos que vamos a usar con el apply mapping y lo cambiamos al formato que necesitemos
+SelectFields_node1650995116507 = ApplyMapping.apply(
+    frame=Join_unnested_json_w_data_node1650993859334,
+    mappings=[
+        (
+            "piggy_bank_health_check_report_id",
+            "string",
+            "piggy_bank_health_check_report_id",
+            "string",
+        ),
+        ("status_code", "int", "status_code", "int"),
+        ("created_date", "timestamp", "created_date", "timestamp"),
+        ("piggy_bank_id", "string", "piggy_bank_id", "string"),
+        ("update_date", "timestamp", "update_date", "timestamp"),
+        ("nested_details_copy", "string", "nested_details_copy", "string"),
+        ("`nested_details.status_code`", "string", "device_status_code", "int"),
+        ("`nested_details.id`", "string", "device_id", "int"),
+        ("`nested_details.date`", "string", "details_date", "timestamp"),
+        ("`nested_details.message`", "string", "details_message", "string"),
+        ("`nested_details.device`", "string", "details_device", "string"),
+    ],
+    transformation_ctx="SelectFields_node1650995116507",
+)
+df = SelectFields_node1650995116507.toDF()
+# organizamos la base de datos
+df2 = df.sort("piggy_bank_id","device_id","created_date")
+# Definimos las particiones por las que va a hacer el "lag"
+w = Window().partitionBy(col("piggy_bank_id"),col("device_id")).orderBy(col("piggy_bank_id"),col("device_id"),col("created_date"))
+# Creamos una nueva columna que sea el lag de status y de piggybank id
+df2 = df2.select("*", lag("device_status_code").over(w).alias("lag_status"))
+
+# filtramos solo las observaciones en las que hay un cambio de estado
+df2 = df2.na.fill(0,subset=["lag_status"])
+df2 = df2.filter ( (df2.device_status_code != df2.lag_status) | df2.nested_details_copy.isNull())
+df2 = df2.withColumnRenamed("piggy_bank_health_check_report_id","piggy_bank_health_check_report_id_filtered")
+
+DFtoDynamic3 = DynamicFrame.fromDF(df2, glueContext, 'custom_column')
+## eliminamos los datos originales de la tabla anterior para joinearselos despues
+drop_original_fields_node1651171964984 = SelectFields.apply(
+    frame=DFtoDynamic3,
+    paths=[
+        "nested_details_copy",
+        "device_status_code",
+        "device_id",
+        "details_message",
+        "details_date",
+        "details_device",
+        "piggy_bank_health_check_report_id_filtered",
+    ],
+    transformation_ctx="drop_original_fields_node1651171964984",
+)
+
+## le pegamos a la data anterior los datos originales de cada piggybank
+drop_original_fields_node1651171964984DF = drop_original_fields_node1651171964984.toDF()
+Original_data_node1650993770112DF = Original_data_node1650993770112.toDF()
+Join_original_data_node1651172149524 = DynamicFrame.fromDF(
+    drop_original_fields_node1651171964984DF.join(
+        Original_data_node1650993770112DF,
+        (
+            drop_original_fields_node1651171964984DF[
+                "piggy_bank_health_check_report_id_filtered"
+            ]
+            == Original_data_node1650993770112DF["piggy_bank_health_check_report_id"]
+        ),
+        "right",
+    ),
+    glueContext,
+    "Join_original_data_node1651172149524",
+)
+# Seleccionar las columnas que necesitamos de la base de datos
+Select_final_df_node1651173718167 = SelectFields.apply(
+    frame=Join_original_data_node1651172149524,
+    paths=[
+        "nested_details_copy",
+        "device_status_code",
+        "device_id",
+        "details_date",
+        "details_message",
+        "details_device",
+        "piggy_bank_health_check_report_id",
+        "status_code",
+        "created_date",
+        "piggy_bank_id",
+        "update_date",
+    ],
+    transformation_ctx="Select_final_df_node1651173718167",
+)
+# Cargamos los datos asociados a cada piggybank_id, los seleccionamos y los unimos  a la base de datos
+Data_piggy_bank_id_node1651178055886 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="tr_coink_db_prd_piggybank_piggy_bank",
+    transformation_ctx="Data_piggy_bank_id_node1651178055886",
+)
+
+## aplicamos el mapeo a la base para eliminar las columnas que no necesitamos y traer las que necesitmoas en el formato requerido
+Data_piggy_bank_id_node1651178055886 = ApplyMapping.apply(
+    frame=Data_piggy_bank_id_node1651178055886,
+    mappings=[
+        ("max_bills", "int", "max_bills", "int"),
+        ("max_coins", "long", "max_coins", "long"),
+        ("piggy_bank_description", "string", "piggy_bank_description", "string"),
+        ("piggy_bank_id", "string", "piggy_bank_id_right", "string"),
+        ("piggy_bank_type_id", "int", "piggy_bank_type_id", "int"),
+        ("max_weight", "double", "max_weight", "double"),
+        ("piggybank_status_id", "int", "piggybank_status_id", "int"),
+        ("hw_id", "string", "hw_id", "string"),
+        ("location_service_id", "string", "location_service_id", "string"),
+        ("created_date","timestamp","piggybank_created_date","timestamp"),
+    ],
+    transformation_ctx="ApplyMapping_node1651239119957",
+)
+
+# Joinear la los datos de las caracteristicas del piggybank a la base de datos anterior
+Select_final_df_node1651173718167DF = Select_final_df_node1651173718167.toDF()
+Data_piggy_bank_id_node1651178055886DF = Data_piggy_bank_id_node1651178055886.toDF()
+Join_node1651239179341 = DynamicFrame.fromDF(
+    Select_final_df_node1651173718167DF.join(
+        Data_piggy_bank_id_node1651178055886DF,
+        (
+            Select_final_df_node1651173718167DF["piggy_bank_id"]
+            == Data_piggy_bank_id_node1651178055886DF["piggy_bank_id_right"]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_node1651239179341",
+)
+
+## Pegamos los datos del maplocation_id
+Maplocation_id_node1651178513554 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="tr_coink_db_prd_maps_maplocations",
+    transformation_ctx="Maplocation_id_node1651178513554",
+)
+
+## Hacemos el select_fields de los datos que necesitamos de la tabla
+Maplocation_id_node1651178513554 = SelectFields.apply(
+    frame=Maplocation_id_node1651178513554,
+    paths=[
+        "maplocation_id",
+        "maplocation_name",
+        "maplocation_type",
+        "maplocation_description",
+        "maplocation_address",
+    ],
+    transformation_ctx="Maplocation_id_node1651178513554",
+)
+
+## pegamos los datos del maplocation al join que se realizó anteriormente
+
+Join_node1651239179341DF = Join_node1651239179341.toDF()
+Maplocation_id_node1651178513554DF = (
+    Maplocation_id_node1651178513554.toDF()
+)
+Join_node1651239246531 = DynamicFrame.fromDF(
+    Join_node1651239179341DF.join(
+        Maplocation_id_node1651178513554DF,
+        (
+            Join_node1651239179341DF["location_service_id"]
+            == Maplocation_id_node1651178513554DF["maplocation_id"]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_node1651239246531",
+)
+# Incluimos los datos corregidos para el maplocation deseado
+Maplocation_update_node1651178740898 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="tr_ecosistemas_csv",
+    transformation_ctx="Maplocation_update_node1651178740898",
+)
+
+## le hacemos el apply mapping correspondiente
+Maplocation_update_node1651178740898 = ApplyMapping.apply(
+    frame=Maplocation_update_node1651178740898,
+    mappings=[
+        ("maplocation_name", "string", "maplocation_name_right", "string"),
+        ("maplocation_correct", "string", "maplocation_correct", "string"),
+        ("ecosystem_name", "string", "ecosystem_name", "string"),
+        ("city_name", "string", "city_name", "string"),
+        ("latitud", "double", "latitud", "double"),
+        ("longitud", "double", "longitud", "double"),
+    ],
+    transformation_ctx="Maplocation_update_node1651178740898",
+)
+
+## lo unimos con la base de datos que teniamos hasta el momento
+
+Join_node1651239246531DF = Join_node1651239246531.toDF()
+Maplocation_update_node1651178740898DF = (
+    Maplocation_update_node1651178740898.toDF()
+)
+Join_node1651241887258 = DynamicFrame.fromDF(
+    Join_node1651239246531DF.join(
+        Maplocation_update_node1651178740898DF,
+        (
+            Join_node1651239246531DF["maplocation_name"]
+            == Maplocation_update_node1651178740898DF[
+                "maplocation_name_right"
+            ]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_node1651241887258",
+)
+## con estas dos lineas de codigo vemos los marranos que no estan creados en la de maplocation_correct
+# temp=Join_node1651241887258.toDF()
+# temp.filter(col("maplocation_correct").isNull()).select('maplocation_name').distinct().collect()
+## eliminamos los datos que no necesitamos
+Drop_fields_final_node1651241924345 = DropFields.apply(
+    frame=Join_node1651241887258,
+    paths=[
+        "maplocation_name_right",
+        "piggy_bank_id_right",
+        "maplocation_id",
+        "location_service_id",
+        "maplocation_type",
+        "maplocation_name",
+    ],
+    transformation_ctx="Drop_fields_final_node1651241924345",
+)
+# Para hacer el shift de la columna de status
+
+df = Drop_fields_final_node1651241924345.toDF()
+
+# Transform from utc to local time
+df = df.withColumn("details_date",from_utc_timestamp(df["details_date"],"-05:00"))
+df = df.withColumn("created_date",from_utc_timestamp(df["created_date"],"-05:00"))
+df = df.withColumn("update_date",from_utc_timestamp(df["update_date"],"-05:00"))
+df = df.withColumn("piggybank_created_date",from_utc_timestamp(df["piggybank_created_date"],"-05:00"))
+
+DFtoDynamic3 = DynamicFrame.fromDF(df, glueContext, 'custom_column')
+# traemos la data del timpo de piggybank al que corresponde cada uno de los piggybanks
+piggy_bank_type_id_node1651265737234 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="maps_coink_db_prd_piggybank_piggy_bank_types",
+    transformation_ctx="piggy_bank_type_id_node1651265737234",
+)
+
+## seleccionamos los datos que necesitamos.
+piggy_bank_type_id_node1651265737234 = ApplyMapping.apply(
+    frame=piggy_bank_type_id_node1651265737234,
+    mappings=[
+        ("description", "string", "description", "string"),
+        ("enum", "string", "enum", "string"),
+        ("piggy_bank_type_id", "int", "piggy_bank_type_id_right", "int"),
+    ],
+    transformation_ctx="piggy_bank_type_id_node1651265737234",
+)
+
+## Hacemos el join  con la base de datos anteriores
+DFtoDynamic3DF = (
+    DFtoDynamic3.toDF()
+)
+piggy_bank_type_id_node1651265737234DF = (
+    piggy_bank_type_id_node1651265737234.toDF()
+)
+Join_piggy_bank_type_node1651266299572 = DynamicFrame.fromDF(
+    DFtoDynamic3DF.join(
+        piggy_bank_type_id_node1651265737234DF,
+        (
+            DFtoDynamic3DF["piggy_bank_type_id"]
+            == piggy_bank_type_id_node1651265737234DF["piggy_bank_type_id_right"]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_piggy_bank_type_node1651266299572",
+)
+
+
+## seleccionamos las variables que queremos quedarnos y asignamos el tipo de variable que queramos
+ApplyMappingpiggy_type_node1651714930516 = ApplyMapping.apply(
+    frame=Join_piggy_bank_type_node1651266299572,
+    mappings=[
+        ("nested_details_copy", "string", "nested_details_copy", "string"),
+        ("device_status_code", "int", "device_status_code", "int"),
+        ("device_id", "int", "device_id", "int"),
+        ("details_date", "timestamp", "details_date", "timestamp"),
+        ("details_message", "string", "details_message", "string"),
+        ("details_device", "string", "details_device", "string"),
+        (
+            "piggy_bank_health_check_report_id",
+            "string",
+            "piggy_bank_health_check_report_id",
+            "string",
+        ),
+        ("status_code", "int", "status_code", "int"),
+        ("created_date", "timestamp", "created_date", "timestamp"),
+        ("piggy_bank_id", "string", "piggy_bank_id", "string"),
+        ("update_date", "timestamp", "update_date", "timestamp"),
+        ("max_bills", "int", "max_bills", "int"),
+        ("max_coins", "long", "max_coins", "long"),
+        ("piggy_bank_description", "string", "piggy_bank_description", "string"),
+        ("piggy_bank_type_id", "int", "piggy_bank_type_id", "int"),
+        ("max_weight", "double", "max_weight", "double"),
+        ("piggybank_status_id", "int", "piggybank_status_id", "int"),
+        ("hw_id", "string", "hw_id", "string"),
+        ("maplocation_description", "string", "maplocation_description", "string"),
+        ("maplocation_address", "string", "maplocation_address", "string"),
+        ("maplocation_correct", "string", "maplocation_correct", "string"),
+        ("ecosystem_name", "string", "ecosystem_name", "string"),
+        ("city_name", "string", "city_name", "string"),
+        ("latitud", "double", "latitude", "double"),
+        ("longitud", "double", "longitude", "double"),
+        ("description", "string", "piggy_type_description", "string"),
+        ("enum", "string", "piggy_type_name", "string"),
+        ("piggybank_created_date","timestamp","piggybank_created_date","timestamp"),
+    ],
+    transformation_ctx="ApplyMappingpiggy_type_node1651714930516",
+)
+
+# Traemos el piggybank status y se lo pegamos a la base de datos anterior
+piggy_bank_status_node1651267079597 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="maps_coink_db_prd_piggybank_piggybank_status",
+    transformation_ctx="piggy_bank_status_node1651267079597",
+)
+
+## Joinear el status a la base de datos que habiamos creado
+piggy_bank_status_node1651267079597DF = piggy_bank_status_node1651267079597.toDF()
+ApplyMappingpiggy_type_node1651714930516DF = (
+    ApplyMappingpiggy_type_node1651714930516.toDF()
+)
+Join_status_node1651269231559 = DynamicFrame.fromDF(
+    piggy_bank_status_node1651267079597DF.join(
+        ApplyMappingpiggy_type_node1651714930516DF,
+        (
+            piggy_bank_status_node1651267079597DF["piggy_status_id"]
+            == ApplyMappingpiggy_type_node1651714930516DF["piggybank_status_id"]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_status_node1651269231559",
+)
+
+## seleccionamos solo los datos que necesitamos de la tabla joineada
+Join_status_node1651269231559 = ApplyMapping.apply(
+    frame=Join_status_node1651269231559,
+    mappings=[
+        ("description", "string", "description", "string"),
+        ("enum", "string", "enum", "string"),
+        ("enabled", "boolean", "enabled", "boolean"),
+        (
+            "piggybank_status_description",
+            "string",
+            "piggybank_status_description",
+            "string",
+        ),
+        ("nested_details_copy", "string", "nested_details_copy", "string"),
+        ("device_status_code", "int", "device_status_code", "int"),
+        ("device_id", "int", "device_id", "int"),
+        ("details_date", "timestamp", "details_date", "timestamp"),
+        ("details_message", "string", "details_message", "string"),
+        ("details_device", "string", "details_device", "string"),
+        (
+            "piggy_bank_health_check_report_id",
+            "string",
+            "piggy_bank_health_check_report_id",
+            "string",
+        ),
+        ("status_code", "int", "status_code", "int"),
+        ("created_date", "timestamp", "created_date", "timestamp"),
+        ("piggy_bank_id", "string", "piggy_bank_id", "string"),
+        ("update_date", "timestamp", "update_date", "timestamp"),
+        ("max_bills", "int", "max_bills", "int"),
+        ("max_coins", "long", "max_coins", "long"),
+        ("piggy_bank_description", "string", "piggy_bank_description", "string"),
+        ("piggy_bank_type_id", "int", "piggy_bank_type_id", "int"),
+        ("max_weight", "double", "max_weight", "double"),
+        ("piggybank_status_id", "int", "piggybank_status_id", "int"),
+        ("hw_id", "string", "hw_id", "string"),
+        ("maplocation_description", "string", "maplocation_description", "string"),
+        ("maplocation_address", "string", "maplocation_address", "string"),
+        ("maplocation_correct", "string", "maplocation_correct", "string"),
+        ("ecosystem_name", "string", "ecosystem_name", "string"),
+        ("city_name", "string", "city_name", "string"),
+        ("latitude", "double", "latitude", "double"),
+        ("longitude", "double", "longitude", "double"),
+        ("piggy_type_description", "string", "piggy_type_description", "string"),
+        ("piggy_type_name", "string", "piggy_type_name", "string"),
+        ("piggybank_created_date","timestamp","piggybank_created_date","timestamp"),
+    ],
+    transformation_ctx="Join_status_node1651269231559",
+)
+from pyspark.sql.functions import lag, col, lead
+spark.conf.set("spark.sql.sources.partitionOverwriteMode","dynamic")
+# transform the data collection to dataframe
+df = Join_status_node1651269231559.toDF()
+# Save the data in the s3 folder
+
+df = df.sort("piggy_bank_id","device_id","created_date")
+# Definimos las particiones por las que va a hacer el "lead"
+w = Window().partitionBy(col("piggy_bank_id"),col("device_id")).orderBy(col("piggy_bank_id"),col("device_id"),col("created_date"))
+# Creamos una nueva columna que sea la duración de cada status por marrano y device
+df = df.select("*",lead("created_date",1).over(w).alias("dur_dev_status_date"))
+# aca cuando miramos la ultima fecha registrada para cada marrano saca la duración como el tiempo entre la ultima fecha y el time actual
+df = df.withColumn("dur_dev_status_date",when(df.dur_dev_status_date.isNull(),from_utc_timestamp(current_timestamp(),"-05:00").cast("long")-col("created_date").cast("long")).otherwise(col("dur_dev_status_date").cast("long")-col("created_date").cast("long")))
+
+df = df.sort("piggy_bank_id","created_date")
+
+# Definimos las particiones por las que va a hacer el "lead"
+w2 = Window().partitionBy(col("piggy_bank_id")).orderBy(col("piggy_bank_id"),col("created_date"))
+# Creamos una nueva columna que sea la duración de cada status por marrano
+df = df.select("*",lead("created_date", 1).over(w2).alias("dur_status_date"))
+# cuando estamos en el ultimo registro saca la duración como la diferencia entre el ultimo created date y la hora y fecha actual
+df = df.withColumn("dur_status_date",when(df.dur_status_date.isNull(),from_utc_timestamp(current_timestamp(),"-05:00").cast("long")-col("created_date").cast("long")).otherwise(col("dur_status_date").cast("long")-col("created_date").cast("long")))
+
+# guardamos los datos en el s3
+df.write.mode("overwrite").format("parquet").save("s3://cnk-datalake/maplocation/Output//etl_hc_piggybank")
+
+
+# tomamos solo los ultimos datos de cada marrano
+w3 = Window().partitionBy(col("piggy_bank_id")).orderBy(col("created_date").desc())
+df2 = df.withColumn("rows",row_number().over(w3))
+df2 = df2.filter(df2["rows"]==1)
+
+DFtoDynamic = DynamicFrame.fromDF(df, glueContext, 'custom_column')
+DFtoDynamic2 = DynamicFrame.fromDF(df2, glueContext, 'custom_column')
+## información de los marranos con dispensador de tarjetas
+cards_dispensers_piggybank_node1651857865157 = (
+    glueContext.create_dynamic_frame.from_catalog(
+        database="cnk_datalake",
+        table_name="hc_coink_db_prd_piggybank_cards_dispensers_piggybank",
+        transformation_ctx="cards_dispensers_piggybank_node1651857865157",
+    )
+)
+
+# Filtrar los marranos cuyo dispensador se encuentra en estado activo
+Filter_active_cards_dispensers_node1651858845423 = Filter.apply(
+    frame=cards_dispensers_piggybank_node1651857865157,
+    f=lambda row: (row["link_status_id"] == 1),
+    transformation_ctx="Filter_active_cards_dispensers_node1651858845423",
+)
+
+Filter_active_cards_dispensers_node1651858845423 = ApplyMapping.apply(
+    frame=Filter_active_cards_dispensers_node1651858845423,
+    mappings=[
+        ("link_status_id", "int", "link_status_id", "int"),
+        ("cards_dispenser_id", "string", "cards_dispenser_id_right", "string"),
+        ("dispenser_piggybank_id", "string", "dispenser_piggybank_id_left", "string"),
+        ("piggybank_id", "string", "piggybank_id_right", "string"),
+    ],
+    transformation_ctx="Filter_active_cards_dispensers_node1651858845423",
+)
+## Traemos la información de la cantidad de tarjetas dispensadas y la unimos con la tabla de identificador de las tarjetas
+card_dispensers_count_node1651857817859 = glueContext.create_dynamic_frame.from_catalog(
+    database="cnk_datalake",
+    table_name="hc_coink_db_prd_piggybank_cards_dispensers",
+    transformation_ctx="card_dispensers_count_node1651857817859",
+)
+
+
+# Joineamos la información de card_dispensers
+card_dispensers_count_node1651857817859DF = (
+    card_dispensers_count_node1651857817859.toDF()
+)
+Filter_active_cards_dispensers_node1651858845423DF = (
+    Filter_active_cards_dispensers_node1651858845423.toDF()
+)
+Join_card_dispensers_node1651858060879 = DynamicFrame.fromDF(
+    card_dispensers_count_node1651857817859DF.join(
+        Filter_active_cards_dispensers_node1651858845423DF,
+        (
+            card_dispensers_count_node1651857817859DF["cards_dispenser_id"]
+            == Filter_active_cards_dispensers_node1651858845423DF[
+                "cards_dispenser_id_right"
+            ]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_card_dispensers_node1651858060879",
+)
+
+## eliminamos las filas que no necesitamos
+
+Join_card_dispensers_node1651858060879 = DropFields.apply(
+    frame=Join_card_dispensers_node1651858060879,
+    paths=[
+        "cards_dispenser_id_right",
+        "link_status_id",
+        "updated_date",
+        "created_date",
+        "update_operator_id",
+        "description",
+        "operator_id",
+    ],
+    transformation_ctx="Join_card_dispensers_node1651858060879",
+)
+## añadimos la información que contiene el historico de tarjetas dispensadas en el tiempo
+
+# Script generated for node Historic_cards_dispensed
+Historic_cards_dispensed_node1651877816727 = (
+    glueContext.create_dynamic_frame.from_catalog(
+        database="cnk_datalake",
+        table_name="tr_coink_db_prd_piggybank_cards_dispensed",
+        transformation_ctx="Historic_cards_dispensed_node1651877816727",
+    )
+)
+
+
+    
+# convertimos la base a un data frame
+df = Historic_cards_dispensed_node1651877816727.toDF()
+
+# contamos el numero de tarjetas que se han entregado cada dia
+df = df.withColumn("dispensed_date_truncated",to_date(col("dispensed_date")))
+df = df.groupBy("dispenser_piggybank_id","dispensed_date_truncated").count().alias("count")
+
+# Calculamos la media movil de los ultimos 20 dias cuantas tarjetas se dispensaron
+df = df.sort("dispenser_piggybank_id","dispensed_date_truncated")
+w = Window.partitionBy("dispenser_piggybank_id").orderBy(col("dispensed_date_truncated")).rowsBetween(-60,0)
+df = df.withColumn("Ma_avg", mean(col("count")).over(w))
+
+# tomamos solo la ultima observación de la media movil que se calculo previamente
+w3 = Window.partitionBy("dispenser_piggybank_id").orderBy(col("dispensed_date_truncated").desc())
+df = df.withColumn("row",row_number().over(w3))
+df = df.filter(col("row")==1).drop("row")
+
+DFtoDynamic = DynamicFrame.fromDF(df, glueContext, 'custom_column')
+# Joineamos la tabla con la información de las tarjetas dispensadas en el tiempo
+Join_card_dispensers_node1651858060879DF = (
+    Join_card_dispensers_node1651858060879.toDF()
+)
+DFtoDynamicDF = (
+    DFtoDynamic.toDF()
+)
+Join_movingaverage_cardsdispensed_node1651877921776 = DynamicFrame.fromDF(
+    Join_card_dispensers_node1651858060879DF.join(
+        DFtoDynamicDF,
+        (
+            Join_card_dispensers_node1651858060879DF["dispenser_piggybank_id_left"]
+            == DFtoDynamicDF["dispenser_piggybank_id"]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Join_movingaverage_cardsdispensed_node1651877921776",
+)
+# Unir todos los datos para que quede la base de datos final
+DFtoDynamic2DF = (
+    DFtoDynamic2.toDF()
+)
+Join_movingaverage_cardsdispensed_node1651877921776DF = (
+    Join_movingaverage_cardsdispensed_node1651877921776.toDF()
+)
+Joinultimadatadisponible_node1651873809448 = DynamicFrame.fromDF(
+    DFtoDynamic2DF.join(
+        Join_movingaverage_cardsdispensed_node1651877921776DF,
+        (
+            DFtoDynamic2DF["piggy_bank_id"]
+            == Join_movingaverage_cardsdispensed_node1651877921776DF[
+                "piggybank_id_right"
+            ]
+        ),
+        "left",
+    ),
+    glueContext,
+    "Joinultimadatadisponible_node1651873809448",
+)
+
+## Seleccionamos las culumnas que necesitamos del join
+ApplyMappingfinalpormarrano_node1652105446864 = ApplyMapping.apply(
+    frame=Joinultimadatadisponible_node1651873809448,
+    mappings=[
+        (
+            "piggybank_status_description",
+            "string",
+            "piggybank_status_description",
+            "string",
+        ),
+        ("status_code", "int", "status_code", "int"),
+        ("created_date", "timestamp", "created_date", "timestamp"),
+        ("piggy_bank_id", "string", "piggy_bank_id", "string"),
+        ("max_bills", "int", "max_bills", "int"),
+        ("max_coins", "long", "max_coins", "long"),
+        ("piggy_bank_description", "string", "piggy_bank_description", "string"),
+        ("piggy_bank_type_id", "int", "piggy_bank_type_id", "int"),
+        ("max_weight", "double", "max_weight", "double"),
+        ("piggybank_status_id", "int", "piggybank_status_id", "int"),
+        ("hw_id", "string", "hw_id", "string"),
+        ("maplocation_address", "string", "maplocation_address", "string"),
+        ("maplocation_correct", "string", "maplocation_correct", "string"),
+        ("ecosystem_name", "string", "ecosystem_name", "string"),
+        ("city_name", "string", "city_name", "string"),
+        ("latitude", "double", "latitude", "double"),
+        ("longitude", "double", "longitude", "double"),
+        ("piggy_type_name", "string", "piggy_type_name", "string"),
+        ("dur_dev_status_date", "long", "dur_dev_status_date", "long"),
+        ("dur_status_date", "long", "dur_status_date", "long"),
+        ("rows", "int", "rows", "int"),
+        ("cards_dispenser_status_id", "int", "cards_dispenser_status_id", "int"),
+        ("cards_dispenser_id", "string", "cards_dispenser_id", "string"),
+        ("unique_hw_id", "string", "unique_hw_id", "string"),
+        ("card_count", "int", "card_count", "int"),
+        ("capacity", "int", "capacity", "int"),
+        ("count", "long", "count", "long"),
+        ("ma_avg", "double", "ma_avg", "double"),
+        ("piggybank_created_date","timestamp","piggybank_created_date","timestamp"),
+    ],
+    transformation_ctx="ApplyMappingfinalpormarrano_node1652105446864",
+)
+spark.conf.set("spark.sql.sources.partitionOverwriteMode","dynamic")
+    
+# transform the data collection to dataframe
+df = ApplyMappingfinalpormarrano_node1652105446864.toDF()
+DFtoDynamic = DynamicFrame.fromDF(df, glueContext, 'custom_column')
+
+df.write.mode("overwrite").format("parquet").save("s3://cnk-datalake/maplocation/Output//etl_hc_geolocation")
+job.commit()
