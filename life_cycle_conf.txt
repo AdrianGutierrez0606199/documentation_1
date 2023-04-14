@@ -1,0 +1,24 @@
+##############################
+## life cycle configuration ##
+##############################
+
+#!/bin/bash
+
+set -e
+
+# OVERVIEW
+# This script executes an existing Notebook file on the instance during start using nbconvert(https://github.com/jupyter/nbconvert)
+
+# PARAMETERS
+
+ENVIRONMENT=python3
+NOTEBOOK_FILE=/home/ec2-user/SageMaker/Base_Usuarios_Clustering_Mixto.ipynb
+NOTEBOOK_FILE2=/home/ec2-user/SageMaker/canal_y_jurisdiccion.ipynb
+NOTEBOOK_FILE3=/home/ec2-user/SageMaker/report_prediction_script.ipynb
+NOTEBOOK_FILE4=/home/ec2-user/SageMaker/SARLAFT_ORD_PEP.ipynb
+
+source /home/ec2-user/anaconda3/bin/activate "$ENVIRONMENT"
+
+nohup jupyter nbconvert --to notebook "$NOTEBOOK_FILE" "$NOTEBOOK_FILE2" "$NOTEBOOK_FILE3" "$NOTEBOOK_FILE4" --ExecutePreprocessor.timeout=-1 --ExecutePreprocessor.kernel_name=python3 --execute &
+
+#source /home/ec2-user/anaconda3/bin/deactivate
