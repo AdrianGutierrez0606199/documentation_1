@@ -1,0 +1,48 @@
+with ranked AS (
+    SELECT cast(so."service_order_created_date" - interval '5' hour as timestamp) as "service_order_created_date",
+    so."service_order_piggybank_id",so."service_order_status",
+    ROW_NUMBER() OVER(PARTITION BY so."service_order_piggybank_id" 
+        ORDER BY so."service_order_created_date" DESC) as "row_number"
+    FROM "aurora_coink"."piggybank"."service_orders" so
+    WHERE (so."service_order_status" IN (5,6,7,9))
+), ranked_data AS (
+    SELECT CASE WHEN ri."service_order_created_date" IS NULL 
+        THEN gc."piggybank_created_date" 
+        ELSE ri."service_order_created_date" 
+        END as "service_order_created_date",
+    gc."piggy_bank_id",gc."piggybank_created_date",
+    gc."maplocation_correct",gc."piggy_bank_description",
+    gc."latitude",gc."longitude",gc."maplocation_address",
+    gc."piggybank_status_description",gc."max_coins",
+    gc."max_weight",gc."max_bills",gc."city_name"
+    FROM (SELECT rt."service_order_created_date",rt."service_order_piggybank_id" FROM ranked rt WHERE "row_number"=1) ri
+    RIGHT JOIN "AwsDataCatalog"."cnk_datalake"."ow_etl_hc_geolocation" as gc
+        ON ri."service_order_piggybank_id"=gc."piggy_bank_id"
+    WHERE (gc."maplocation_correct" IS NOT NULL) AND (gc."piggy_type_name"<>'PIGLET')
+), trans_piggy AS (
+    SELECT "operation_value","operation_date",
+    "piggy_bank_description" as "description","maplocation_name"
+    FROM "AwsDataCatalog"."cnk_datalake"."nb_notebook_elt_transacciones_overwrite"
+        WHERE "type_description"='DEPOSITO OINK' AND "operation_description"='Transacción aprobada'
+), trans_grouped AS (
+SELECT rd."piggy_bank_id" as "piggybank_id",SUM(tr."operation_value") as "current_value"
+FROM ranked_data rd
+LEFT JOIN  trans_piggy tr
+    ON tr."maplocation_name"=rd."maplocation_correct" AND tr."description"=rd."piggy_bank_description"
+WHERE tr."operation_date">= rd."service_order_created_date"
+GROUP BY (rd."piggy_bank_id")
+)
+SELECT rd."piggy_bank_id" as "piggybank_id",
+CASE WHEN tg."current_value" IS NULL THEN 0 ELSE tg."current_value" END as "current_value",
+td."value",td."weight",td."bills",td."coins",rd."piggy_bank_description",rd."max_coins",rd."max_weight",
+rd."max_bills",rd."maplocation_address",rd."maplocation_correct",rd."city_name",rd."latitude" as "latitud",
+rd."longitude" as "longituid",rd."piggybank_created_date",rd."service_order_created_date" as "last_arqueo_date",
+pgb."piggy_bank_operational_account" as "account_number",rd."piggybank_status_description"
+FROM ranked_data rd
+    LEFT JOIN  trans_grouped tg
+        ON tg."piggybank_id"=rd."piggy_bank_id"
+    LEFT JOIN "aurora_coink"."piggybank"."total_details" td
+        ON rd."piggy_bank_id"=td."piggybank_id"
+    LEFT JOIN "aurora_coink"."piggybank"."piggy_bank" pgb
+        ON rd."piggy_bank_id"=pgb."piggy_bank_id";
+
